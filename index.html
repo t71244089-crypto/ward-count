@@ -1041,13 +1041,22 @@ function render(){
     cs.shifts[shift].saved=true;
     const now=new Date();
     cs.shifts[shift].savedAt=`${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-    saveToHistory();
+
+    // ★ saveToHistory를 async로 변경하고 await
+    const today=todayStr();
+    if(!cs.history) cs.history=[];
+    let todayRec=cs.history.find(h=>h.date===today);
+    if(!todayRec){ todayRec={date:today,shifts:{}}; cs.history.unshift(todayRec); }
+    todayRec.shifts[shift]=JSON.parse(JSON.stringify(cs.shifts[shift]));
+    cs.history=cs.history.slice(0,7);
 
     sdb.textContent='저장 중...'; sdb.disabled=true;
     try{
       // ① countState 전체 저장
       await saveCS(dept, cs);
-      // ② 이 교대를 별도 경로에도 영구 보관 (덮어씌워짐 방지)
+      // ② 히스토리 독립 경로에 저장 (await로 확실히)
+      await saveHistory(dept, today, shift, cs.shifts[shift]);
+      // ③ savedShifts 경로에도 저장
       await saveFinalShift(dept, shift, cs.shifts[shift]);
       render();
       toast('✅ 저장 완료!');
@@ -1087,35 +1096,52 @@ function render(){
 // ═══════════════════════
 async function saveHistory(d, date, shiftKey, snapshot){
   const clean = JSON.parse(JSON.stringify(snapshot));
-  if(db) return fbSet(`depts/${d}/history/${date}/${shiftKey}`, clean).catch(e=>console.warn('히스토리 저장 실패:', e));
-  // 오프라인: localStorage에 백업
+  // ① 독립 경로 저장 (await로 확실히)
+  if(db){
+    try{
+      await fbSet(`depts/${d}/history/${date}/${shiftKey}`, clean);
+      console.log(`📚 히스토리 저장: ${d} ${date} ${shiftKey}`);
+    } catch(e){ console.warn('히스토리 독립경로 저장 실패:', e); }
+  }
+  // ② localStorage 백업 (항상 실행)
   const key=`wc_hist_${d}`;
   const h=LS.g(key)||{};
   if(!h[date]) h[date]={};
   h[date][shiftKey]=clean;
-  // 8일 이상 된 날짜 삭제
-  const dates=Object.keys(h).sort().reverse();
-  dates.slice(7).forEach(old=>delete h[old]);
+  const allDates=Object.keys(h).sort().reverse();
+  allDates.slice(7).forEach(old=>delete h[old]);
   LS.s(key,h);
 }
 
 async function loadHistory(d){
+  // Firebase + localStorage 병합
+  let fbData={}, lsData={};
   if(db){
-    const v=await fbGet(`depts/${d}/history`);
-    return v||{};
+    try{ fbData=await fbGet(`depts/${d}/history`)||{}; }
+    catch(e){ console.warn('히스토리 Firebase 로드 실패:', e); }
   }
-  return LS.g(`wc_hist_${d}`)||{};
+  try{ lsData=LS.g(`wc_hist_${d}`)||{}; } catch(e){}
+
+  // 두 소스 병합 (Firebase 우선)
+  const merged = JSON.parse(JSON.stringify(lsData));
+  Object.entries(fbData).forEach(([date, shifts])=>{
+    if(!merged[date]) merged[date]={};
+    Object.entries(shifts).forEach(([sk, data])=>{
+      merged[date][sk]=data; // Firebase 값으로 덮어쓰기
+    });
+  });
+  return merged;
 }
 
 function saveToHistory(){
   const today=todayStr();
-  // cs 내부 history도 유지 (하위 호환)
   if(!cs.history) cs.history=[];
   let todayRec=cs.history.find(h=>h.date===today);
   if(!todayRec){ todayRec={date:today,shifts:{}}; cs.history.unshift(todayRec); }
+  // ★ 현재 shift 최신값으로 덮어쓰기
   todayRec.shifts[shift]=JSON.parse(JSON.stringify(cs.shifts[shift]));
   cs.history=cs.history.slice(0,7);
-  // ★ 별도 경로에도 독립 저장
+  // ★ await 없이 호출하지 않음 — 비동기로 처리
   saveHistory(dept, today, shift, cs.shifts[shift]);
 }
 
