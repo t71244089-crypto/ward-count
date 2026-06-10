@@ -1051,6 +1051,12 @@ function render(){
       await saveFinalShift(dept, shift, cs.shifts[shift]);
       render();
       toast('✅ 저장 완료!');
+      // ★ 히스토리 모달이 열려있으면 자동 갱신
+      const mHistEl=document.getElementById('mHist');
+      if(mHistEl && mHistEl.classList.contains('on')){
+        const hBody=document.getElementById('mHistBody');
+        if(hBody) loadAndRenderHist(hBody);
+      }
     } catch(e){
       console.error('저장 실패:', e);
       // 저장 실패 시 saved 플래그 되돌리기
@@ -1116,13 +1122,19 @@ function saveToHistory(){
 // ═══════════════════════
 // HISTORY MODAL
 // ═══════════════════════
-document.getElementById('histBtn').addEventListener('click', async ()=>{
+document.getElementById('histBtn').addEventListener('click', ()=>openHistModal());
+
+async function openHistModal(){
   const modal=document.getElementById('mHist');
   const body=document.getElementById('mHistBody');
   body.innerHTML=`<div style="text-align:center;padding:20px;color:var(--mu)">불러오는 중...</div>`;
   modal.classList.add('on');
 
-  // Firebase 독립 경로 + cs 내부 history 병합
+  await loadAndRenderHist(body);
+}
+
+async function loadAndRenderHist(body){
+  // ★ 매번 Firebase에서 최신 데이터 로드
   let histObj = {};
   try{ histObj = await withTimeout(loadHistory(dept), 5000); }
   catch(e){ histObj={}; }
@@ -1147,7 +1159,6 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
     return;
   }
 
-  // 날짜 탭
   let selDate = dates[0];
 
   function renderHist(date){
@@ -1157,13 +1168,32 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
     // 날짜 탭 헤더
     h += `<div class="hist-date-tabs">`;
     dates.forEach(d=>{
-      // 해당 날짜에 저장된 교대 수 표시
-      const saved = SHIFT_KEYS.filter(sk=>dayData[sk]&&dayData[sk].savedAt).length;
+      const dData = histObj[d]||{};
+      const saved = SHIFT_KEYS.filter(sk=>dData[sk]&&dData[sk].savedAt).length;
       h += `<button class="hist-date-tab ${d===date?'on':''}" data-hdate="${d}">
         ${d.slice(5)}<span class="hist-date-cnt">${saved?saved+'교대':''}</span>
       </button>`;
     });
     h += `</div>`;
+
+    // 변경 알림 배너 — 현재 물품목록과 기록 시점 차이 체크
+    const allRecordedIds = new Set();
+    SHIFT_KEYS.forEach(sk=>{
+      const sd=dayData[sk];
+      if(sd&&sd.items) Object.keys(sd.items).forEach(id=>allRecordedIds.add(id));
+    });
+    const currentIds = new Set(SECS.flatMap(s=>s.items.map(it=>it.id)));
+    const newItems   = [...currentIds].filter(id=>!allRecordedIds.has(id));
+    const oldItems   = [...allRecordedIds].filter(id=>!currentIds.has(id));
+
+    if(newItems.length||oldItems.length){
+      h+=`<div style="padding:8px 11px;margin-bottom:8px;background:rgba(121,134,203,.08);border:1px solid rgba(121,134,203,.25);border-radius:8px;font-size:11px;color:var(--dim);">
+        ℹ️ 물품목록이 변경되었습니다.
+        ${newItems.length?`<span style="color:var(--ok)"> ✚ 신규 ${newItems.length}개</span>`:''}
+        ${oldItems.length?`<span style="color:var(--mu)"> 🗑 삭제 ${oldItems.length}개</span>`:''}
+        — 현재 목록 기준으로 표시됩니다.
+      </div>`;
+    }
 
     let hasAny=false;
     SHIFT_KEYS.forEach(sk=>{
@@ -1172,8 +1202,7 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
       hasAny=true;
       const shInf=SHIFTS[sk];
 
-      // 부족/소독 요약
-      const issues=[];
+      // 부족/소독 요약 — 현재 SECS 기준
       let shortCount=0, sterilCount=0;
       SECS.forEach(sec=>sec.items.forEach(it=>{
         const e=(sd.items&&sd.items[it.id])||{};
@@ -1192,22 +1221,47 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
         ${shortCount>0?`<div style="padding:4px 10px;font-size:11px;color:var(--warn);background:rgba(255,167,38,.08)">⚠️ 부족 ${shortCount}종</div>`:''}
         ${sterilCount>0?`<div style="padding:4px 10px;font-size:11px;color:var(--info);background:rgba(41,182,246,.06)">🔵 소독중 ${sterilCount}종</div>`:''}
         <table class="hist-table">
-          <tr><th>물품명</th><th style="text-align:center">기준</th><th style="text-align:center">카운트</th><th style="text-align:center">소독중</th><th style="text-align:center">현재보유</th></tr>`;
+          <tr>
+            <th>물품명</th>
+            <th style="text-align:center">기준<br><span style="font-size:9px;font-weight:400">(현재)</span></th>
+            <th style="text-align:center">카운트</th>
+            <th style="text-align:center">소독중</th>
+            <th style="text-align:center">현재보유</th>
+          </tr>`;
 
+      // ① 현재 SECS 기준 항목 표시
       SECS.forEach(sec=>{
         h+=`<tr><td colspan="5" style="font-size:10px;color:var(--mu);background:var(--sf2);padding:3px 8px;">${sec.icon} ${sec.name}</td></tr>`;
         sec.items.forEach(it=>{
           const e=(sd.items&&sd.items[it.id])||{};
+          const hasRecord = sd.items && sd.items[it.id] !== undefined;
           const cnt=Number(e.count||0), sOut=Number(e.sterilOut||0), sRet=Number(e.sterilReturned||0);
           const holding=cnt+sRet, sterilizing=Math.max(0,sOut-sRet);
+          const note=e.note||'';
+
+          // 이 교대 기록 시점에 없던 신규 항목
+          if(!hasRecord){
+            h+=`<tr style="opacity:.55">
+              <td>${it.name} <span class="std-badge">(${it.std})</span>
+                <span style="font-size:10px;color:var(--acc);margin-left:4px">✚ 기록 당시 미존재</span>
+              </td>
+              <td style="text-align:center;color:var(--mu)">${it.std}</td>
+              <td style="text-align:center;color:var(--mu)">—</td>
+              <td style="text-align:center;color:var(--mu)">—</td>
+              <td style="text-align:center;color:var(--mu)">—</td>
+            </tr>`;
+            return;
+          }
+
           let tdCls='';
           if(holding>0||sOut>0){
             if(holding<it.std) tdCls='hist-warn';
-            else if(holding>=it.std) tdCls='hist-ok';
+            else tdCls='hist-ok';
           }
-          const note=e.note||'';
           h+=`<tr>
-            <td>${it.name}${note?`<div style="font-size:10px;color:var(--mu)">📝 ${note}</div>`:''}</td>
+            <td>${it.name} <span class="std-badge">(${it.std})</span>
+              ${note?`<div style="font-size:10px;color:var(--mu)">📝 ${note}</div>`:''}
+            </td>
             <td style="text-align:center;color:var(--mu)">${it.std}</td>
             <td style="text-align:center;font-family:monospace">${cnt||'—'}</td>
             <td style="text-align:center;color:var(--info)">${sterilizing>0?sterilizing:'—'}</td>
@@ -1215,6 +1269,24 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
           </tr>`;
         });
       });
+
+      // ② 현재 목록에서 삭제된 항목 (기록은 있지만 SECS에서 제거됨) — 회색으로 표시
+      const deletedEntries = Object.entries(sd.items||{}).filter(([id])=>!currentIds.has(id));
+      if(deletedEntries.length){
+        h+=`<tr><td colspan="5" style="font-size:10px;color:var(--mu);background:var(--sf2);padding:3px 8px;">🗑 삭제된 항목 (참고용)</td></tr>`;
+        deletedEntries.forEach(([id,e])=>{
+          const cnt=Number(e.count||0), sOut=Number(e.sterilOut||0), sRet=Number(e.sterilReturned||0);
+          const holding=cnt+sRet, sterilizing=Math.max(0,sOut-sRet);
+          h+=`<tr style="opacity:.45">
+            <td style="color:var(--mu);text-decoration:line-through">${id}</td>
+            <td style="text-align:center;color:var(--mu)">—</td>
+            <td style="text-align:center;font-family:monospace">${cnt||'—'}</td>
+            <td style="text-align:center">${sterilizing>0?sterilizing:'—'}</td>
+            <td style="text-align:center;font-family:monospace">${holding>0||sOut>0?holding:'—'}</td>
+          </tr>`;
+        });
+      }
+
       h+=`</table></div>`;
     });
 
@@ -1224,17 +1296,18 @@ document.getElementById('histBtn').addEventListener('click', async ()=>{
 
     body.innerHTML=h;
 
-    // 날짜 탭 클릭
     body.querySelectorAll('.hist-date-tab').forEach(btn=>{
-      btn.addEventListener('click',()=>{
+      btn.addEventListener('click', async ()=>{
         selDate=btn.dataset.hdate;
-        renderHist(selDate);
+        // ★ 탭 클릭 시에도 Firebase 재로드 → 수정 후 즉시 반영
+        body.innerHTML=`<div style="text-align:center;padding:20px;color:var(--mu)">불러오는 중...</div>`;
+        await loadAndRenderHist(body);
       });
     });
   }
 
   renderHist(selDate);
-});
+}
 document.getElementById('mHistClose').addEventListener('click',()=>document.getElementById('mHist').classList.remove('on'));
 document.getElementById('mHistOk').addEventListener('click',()=>document.getElementById('mHist').classList.remove('on'));
 
